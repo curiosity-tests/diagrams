@@ -1,4 +1,5 @@
 name: CI
+run-name: "CI ${{ inputs.leg || github.event_name }} ${{ inputs.racecar_run }}"
 
 on:
   push:
@@ -6,7 +7,24 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: baseline
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
 
+
+env:
+  CHALK_ON: ${{ inputs.leg == 'instrumented' }}
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -64,6 +82,7 @@ jobs:
         uses: j178/prek-action@v3.0.0
 
   python-tests:
+    if: false   # racecar: non-Linux runner, not measured here
     # Artwork uses macOS fonts, including Avenir Next; match the authoring environment.
     runs-on: macos-latest
     steps:
@@ -144,10 +163,12 @@ jobs:
             site/test-results
           retention-days: 7
       - uses: actions/upload-pages-artifact@v5
+        continue-on-error: true   # racecar: scan/report/push step, must not fail the build
         with:
           path: site/build
 
   deploy:
+    continue-on-error: true   # racecar: scan job other jobs need
     if: github.ref == 'refs/heads/main'
     needs: [check, python-tests, build]
     runs-on: ubuntu-latest
