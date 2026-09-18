@@ -39,7 +39,7 @@ jobs:
     needs: checks
     runs-on: ubuntu-latest
     steps:
-      - run: test '${{ needs.checks.result }}' = success
+    - run: test '${{ needs.checks.result }}' = success
 
   checks:
     runs-on: ubuntu-latest
@@ -48,162 +48,355 @@ jobs:
       matrix:
         task: [lint, unit]
     steps:
-      - uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-          persist-credentials: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - uses: typst-community/setup-typst@v5
-      - uses: astral-sh/setup-uv@v10.0.1
-        with:
-          python-version: '3.14'
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cache/pnpm
-            ~/.npm
-            ~/.cache/typst/packages
-          key: checks-${{ runner.os }}-${{ hashFiles('site/package.json', 'assets/**/*.typ') }}
-          restore-keys: checks-${{ runner.os }}-
-      - name: Install site dependencies
-        run: |
-          corepack enable
-          printf 'allowBuilds:\n  svelte-widgets: true\n  sharp: true\n' > pnpm-workspace.yaml
-          # npm prepares Git dependencies; avoid its conflicting optional Vitest peers.
-          NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --no-lockfile --store-dir ~/.cache/pnpm
-        working-directory: site
-      - name: Unit tests
-        if: matrix.task == 'unit'
-        run: pnpm test
-        working-directory: site
+    - uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+        persist-credentials: false
+    - uses: typst-community/setup-typst@v5
+    - uses: astral-sh/setup-uv@v10.0.1
+      with:
+        python-version: '3.14'
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 24
+    - uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cache/pnpm
+          ~/.npm
+          ~/.cache/typst/packages
+        key: checks-${{ runner.os }}-${{ hashFiles('site/package.json', 'assets/**/*.typ') }}
+        restore-keys: checks-${{ runner.os }}-
+    - name: Install site dependencies
+      run: |
+        corepack enable
+        printf 'allowBuilds:\n  svelte-widgets: true\n  sharp: true\n' > pnpm-workspace.yaml
+        # npm prepares Git dependencies; avoid its conflicting optional Vitest peers.
+        NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --no-lockfile --store-dir ~/.cache/pnpm
+      working-directory: site
+    - name: Unit tests
+      if: matrix.task == 'unit'
+      run: pnpm test
+      working-directory: site
 
-      - name: Run prek
-        if: matrix.task == 'lint'
-        uses: j178/prek-action@v3.0.0
+    - name: Run prek
+      if: matrix.task == 'lint'
+      uses: j178/prek-action@v3.0.0
 
-  python-tests:
-    if: false   # racecar: non-Linux runner, not measured here
-    # Artwork uses macOS fonts, including Avenir Next; match the authoring environment.
-    runs-on: macos-latest
-    steps:
-      - uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-          persist-credentials: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - uses: astral-sh/setup-uv@v10.0.1
-        with:
-          python-version: '3.14'
-      - uses: typst-community/setup-typst@v5
-      - name: Install image tools
-        run: brew install imagemagick zopfli
-      - name: Python tests
-        run: uv run --no-project --with pytest --with pyyaml pytest -q
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   link-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-          persist-credentials: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Discover broken links
-        uses: lycheeverse/lychee-action@v2
-        with:
+    - uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+        persist-credentials: false
+    - name: Discover broken links
+      uses: lycheeverse/lychee-action@v2
+      with:
           # increase max-redirects needed for some journal links
           # ${...} becomes $%7B...%7D once lychee percent-encodes the extracted URL
-          args: --accept 100..=103,200..=299,403,429,500,503 --max-redirects 10 --timeout 30 --exclude-all-private --exclude '\$(\{.*\}|%7B.*%7D)' --exclude 'chemicalaid\.com' --exclude 'janosh\.github\.io/diagrams' --exclude 'diagrams\.janosh\.dev' --exclude 'arxiv\.org' --exclude 'sciencedirect\.com' --exclude 'rolandwanner\.com' --exclude 'tikz\.dev' -- ./**/*.{typ,tex,md,svelte,ts,yml}
+        args: --accept 100..=103,200..=299,403,429,500,503 --max-redirects 10 --timeout 30 --exclude-all-private --exclude '\$(\{.*\}|%7B.*%7D)' --exclude 'chemicalaid\.com' --exclude 'janosh\.github\.io/diagrams' --exclude 'diagrams\.janosh\.dev' --exclude 'arxiv\.org' --exclude 'sciencedirect\.com' --exclude 'rolandwanner\.com' --exclude 'tikz\.dev' -- ./**/*.{typ,tex,md,svelte,ts,yml}
 
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-          persist-credentials: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cache/pnpm
-            ~/.npm
-          key: build-deps-${{ runner.os }}-${{ hashFiles('site/package.json') }}
-          restore-keys: build-deps-${{ runner.os }}-
-      - uses: actions/cache/restore@v6
-        id: images
-        with:
-          path: site/node_modules/.cache/imagetools
-          key: imagetools-${{ hashFiles('assets/**/*.png', 'site/src/lib/index.ts', 'site/package.json') }}
-          restore-keys: imagetools-
-      - name: Install site dependencies
-        run: |
-          corepack enable
-          printf 'allowBuilds:\n  svelte-widgets: true\n  sharp: true\n' > pnpm-workspace.yaml
-          # npm prepares Git dependencies; avoid its conflicting optional Vitest peers.
-          NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --no-lockfile --store-dir ~/.cache/pnpm
-        working-directory: site
-      - run: pnpm exec vite build
-        working-directory: site
-      - uses: actions/cache/save@v6
-        if: steps.images.outputs.cache-hit != 'true'
-        with:
-          path: site/node_modules/.cache/imagetools
-          key: ${{ steps.images.outputs.cache-primary-key }}
-      - name: Install browser for visual checks
-        run: pnpm exec playwright install --with-deps --only-shell chromium
-        working-directory: site
-      - name: Visual regression checks
-        run: pnpm test:visual
-        working-directory: site
-      - name: Upload visual failure report
-        if: failure()
-        uses: actions/upload-artifact@v6
-        with:
-          name: visual-regression-report
-          path: |
-            site/playwright-report
-            site/test-results
-          retention-days: 7
-      - uses: actions/upload-pages-artifact@v5
-        continue-on-error: true   # racecar: scan/report/push step, must not fail the build
-        with:
-          path: site/build
+    - uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+        persist-credentials: false
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 24
+    - uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cache/pnpm
+          ~/.npm
+        key: build-deps-${{ runner.os }}-${{ hashFiles('site/package.json') }}
+        restore-keys: build-deps-${{ runner.os }}-
+    - uses: actions/cache/restore@v6
+      id: images
+      with:
+        path: site/node_modules/.cache/imagetools
+        key: imagetools-${{ hashFiles('assets/**/*.png', 'site/src/lib/index.ts', 'site/package.json') }}
+        restore-keys: imagetools-
+    - name: Install site dependencies
+      run: |
+        corepack enable
+        printf 'allowBuilds:\n  svelte-widgets: true\n  sharp: true\n' > pnpm-workspace.yaml
+        # npm prepares Git dependencies; avoid its conflicting optional Vitest peers.
+        NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --no-lockfile --store-dir ~/.cache/pnpm
+      working-directory: site
+    - run: pnpm exec vite build
+      working-directory: site
+    - uses: actions/cache/save@v6
+      if: steps.images.outputs.cache-hit != 'true'
+      with:
+        path: site/node_modules/.cache/imagetools
+        key: ${{ steps.images.outputs.cache-primary-key }}
+    - name: Install browser for visual checks
+      run: pnpm exec playwright install --with-deps --only-shell chromium
+      working-directory: site
+    - name: Visual regression checks
+      run: pnpm test:visual
+      working-directory: site
+    - name: Upload visual failure report
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: visual-regression-report
+        path: |
+          site/playwright-report
+          site/test-results
+        retention-days: 7
+    - uses: actions/upload-pages-artifact@v5
+      continue-on-error: true     # racecar: scan/report/push step, must not fail the build
+      with:
+        path: site/build
 
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   deploy:
     continue-on-error: true   # racecar: scan job other jobs need
     if: github.ref == 'refs/heads/main'
-    needs: [check, python-tests, build]
+    needs:
+    - check
+    - build
     runs-on: ubuntu-latest
     permissions:
       pages: write
@@ -212,5 +405,5 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - id: deploy
-        uses: actions/deploy-pages@v5
+    - id: deploy
+      uses: actions/deploy-pages@v5
